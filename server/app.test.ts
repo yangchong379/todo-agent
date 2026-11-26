@@ -172,3 +172,64 @@ test("有多个匹配、缺少目标、询问或否定时不会修改任务", as
   assert.deepEqual((await request("GET", "/api/tasks")).body, before);
   assert.equal(await chat("删掉买牛奶"), "已删除「买牛奶」。");
 });
+
+test("日程、义务和换一种说法的请求都能写入同一份清单", async (t) => {
+  const { chat, request } = await startTestApp(t, { live: true });
+  const plans = [
+    ["我晚上有个会议", "晚上有个会议"],
+    ["明天得去取快递", "明天去取快递"],
+    ["周末下午三点看牙", "周末下午三点看牙"],
+    ["我打算给妈妈打电话", "给妈妈打电话"],
+    ["能帮我把周五交报告放进我的待办吗？", "周五交报告"],
+  ] as const;
+  for (const [message, title] of plans) {
+    assert.equal(await chat(message), "已添加待办「" + title + "」。");
+  }
+  assert.match(await chat("还有哪些事没做？"), /待办（5）/u);
+  assert.match(await chat("帮我记一下晚上有个会议"), /已经在待办/u);
+  assert.equal(await chat("我开完会了"), "已完成「晚上有个会议」。");
+  assert.equal(await chat("我取完快递了"), "已完成「明天去取快递」。");
+  const { body } = await request("GET", "/api/tasks");
+  assert.deepEqual(
+    body.map(({ title }: { title: string }) => title),
+    plans.map(([, title]) => title),
+  );
+  assert.deepEqual(
+    body.map(({ done }: { done: boolean }) => done),
+    [true, true, false, false, false],
+  );
+});
+
+test("问题、否定、假设、闲聊和已经过去的日程不会新增任务", async (t) => {
+  const { chat, request } = await startTestApp(t, { live: true });
+  for (const message of [
+    "我晚上有个会议吗？",
+    "明天要不要去取快递",
+    "我晚上不用开会",
+    "晚上去不了医院",
+    "我晚上有个会议但取消了",
+    "如果我晚上有个会议，就改天再聊",
+    "可能今晚有会",
+    "我晚上有机会",
+    "今天真冷",
+    "昨天晚上有个会议",
+  ]) {
+    assert.doesNotMatch(await chat(message), /已添加待办/u, message);
+  }
+  assert.deepEqual((await request("GET", "/api/tasks")).body, []);
+});
+
+test("多场会议未指明目标时不替用户选择，准备会议的任务不算作会议", async (t) => {
+  const { chat, request } = await startTestApp(t, { live: true });
+  await chat("今晚有个会议");
+  await chat("明晚开会");
+  await chat("帮我记一下准备会议资料");
+
+  assert.match(await chat("会议结束了"), /有 2 条匹配/u);
+  assert.match(await chat("还有哪些事没做？"), /待办（3）/u);
+  assert.equal(await chat("今晚有个会议结束了"), "已完成「今晚有个会议」。");
+  assert.deepEqual(
+    (await request("GET", "/api/tasks")).body.map(({ done }: { done: boolean }) => done),
+    [true, false, false],
+  );
+});

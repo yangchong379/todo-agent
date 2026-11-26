@@ -23,6 +23,16 @@ function findTasks(tasks: Task[], target: string, complete: boolean) {
   if (exact.length) return exact.map(({ task }) => task);
 
   if (complete) {
+    if (/^(?:会|会议|开会|开会议)$/u.test(name)) {
+      return titles
+        .filter(
+          (item) =>
+            /(?:有(?:一?[个场次])?|开(?:一?[个场次])?|参加)(?:会|.*?(?:会议|例会|周会|早会|组会|家长会))(?:要(?:开|参加))?$/u.test(
+              item.name,
+            ) && !/(?:准备|取消|安排|推迟)会/u.test(item.name),
+        )
+        .map(({ task }) => task);
+    }
     // 例如「牛奶买好了」去掉完成语气后，按动词在前的词序匹配「买牛奶」。
     const reordered = titles.filter(
       (item) => item.name.length === name.length && (name + name).includes(item.name),
@@ -98,7 +108,7 @@ export function createReply(tasks: TaskStore) {
         return updated ? `已完成「${updated.title}」。` : "这条任务已不在清单中。";
       }
       case "unknown":
-        return "我可以帮你管理待办。试试「帮我记一下洗衣服」「看看我的待办」「衣服洗好了」或「删掉洗衣服」。";
+        return "你可以直接说接下来要做什么，比如「我晚上有个会议」。也可以问「还有哪些事没做」，或说「衣服洗好了」。";
     }
   };
 }

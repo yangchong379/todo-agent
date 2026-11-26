@@ -26,6 +26,8 @@ test("DeepSeek 只解释本轮消息，拒绝无效参数或用户未提到的�
   );
 
   assert.deepEqual(await interpret("帮我记一下洗衣服"), { action: "create", title: "洗衣服" });
+  assert.deepEqual(await interpret("我晚上有个会议"), { action: "create", title: "晚上有个会议" });
+  assert.deepEqual(await interpret("我晚上有个会议吗？"), { action: "unknown" });
   assert.equal(fetch.mock.callCount(), 0);
 
   assert.deepEqual(await interpret(message), { action: "create", title: "报名讲座" });
