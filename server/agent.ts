@@ -1,8 +1,31 @@
+import { createHash } from "node:crypto";
 import type { ChatMessage } from "../shared/chat.ts";
 import { interpret } from "./intent.ts";
 import { taskTitleSchema, type Task, type TaskStore } from "./task-store.ts";
 
 export type { ChatMessage } from "../shared/chat.ts";
+
+type Mutation = "complete" | "delete";
+
+interface Clarification {
+  action: Mutation;
+  candidates: Task[];
+}
+
+function conversationKey(messages: ChatMessage[]) {
+  const turns = messages.map(({ role, content }) => [role, content]);
+  return createHash("sha256").update(JSON.stringify(turns)).digest("hex");
+}
+
+function choiceNumber(content: string) {
+  const choice =
+    /^(?:选\s*)?(?:第\s*)?([0-9]+|[一二三四五六七八九十两])\s*(?:条|项|个)?[。！!]?$/u.exec(
+      content.normalize("NFKC"),
+    )?.[1];
+  if (!choice) return undefined;
+  if (choice === "两") return 2;
+  return /^[0-9]+$/u.test(choice) ? Number(choice) : "一二三四五六七八九十".indexOf(choice) + 1;
+}
 
 function normalize(title: string) {
   return title
@@ -60,9 +83,55 @@ function renderList(tasks: Task[], status: "all" | "pending" | "done") {
 }
 
 export function createReply(tasks: TaskStore) {
+  const clarifications = new Map<string, Clarification | null>();
+
+  function askWhich(messages: ChatMessage[], clarification: Clarification) {
+    const { action, candidates } = clarification;
+    const verb = action === "delete" ? "删除" : "完成";
+    const options = candidates.map(
+      (task, index) => `${index + 1}. ${task.done ? "已完成" : "待办"} · 「${task.title}」`,
+    );
+    const content = `有 ${candidates.length} 条匹配的任务。请回复序号，选择要${verb}哪一条。\n${options.join("\n")}`;
+    const key = conversationKey([...messages, { role: "assistant", content }]);
+    const existing = clarifications.get(key);
+    if (!clarifications.has(key)) {
+      clarifications.set(key, clarification);
+      if (clarifications.size > 100) {
+        const oldest = clarifications.keys().next();
+        if (!oldest.done) clarifications.delete(oldest.value);
+      }
+    } else if (existing?.candidates.some((task, index) => task.id !== candidates[index]?.id)) {
+      // 相同的可见对话如果对应不同的任务 ID，要求重新选定，避免按旧序号误删。
+      clarifications.set(key, null);
+    }
+    return content;
+  }
+
+  function mutate(action: Mutation, task: Task) {
+    if (action === "delete") {
+      return tasks.remove(task.id) ? `已删除「${task.title}」。` : "这条任务已不在清单中。";
+    }
+    if (task.done) return `「${task.title}」已经是已完成状态。`;
+    const updated = tasks.update(task.id, { done: true });
+    return updated ? `已完成「${updated.title}」。` : "这条任务已不在清单中。";
+  }
+
   return async function reply(messages: ChatMessage[]): Promise<string> {
     const message = messages.at(-1);
     if (message?.role !== "user") return "请告诉我你想管理哪条待办。";
+
+    const number = choiceNumber(message.content);
+    if (number !== undefined) {
+      const clarification = clarifications.get(conversationKey(messages.slice(0, -1)));
+      if (!clarification) return "请先说要操作哪条任务，我列出候选后你就可以选序号。";
+      const selected = clarification.candidates[number - 1];
+      if (!selected) return askWhich(messages, clarification);
+      const task = tasks.list().find((item) => item.id === selected.id);
+      if (!task || task.title !== selected.title || task.done !== selected.done) {
+        return "刚才选中的任务已经变化，请重新说要操作哪条任务。";
+      }
+      return mutate(clarification.action, task);
+    }
 
     const intent = await interpret(message.content);
     switch (intent.action) {
@@ -76,6 +145,8 @@ export function createReply(tasks: TaskStore) {
       }
       case "list":
         return renderList(tasks.list(), intent.status);
+      case "keep":
+        return `好的，保留「${intent.target}」。`;
       case "complete":
       case "delete": {
         const completing = intent.action === "complete";
@@ -87,25 +158,27 @@ export function createReply(tasks: TaskStore) {
           return `你想${verb}哪条任务？请带上任务名称。`;
         }
 
-        const matches = findTasks(tasks.list(), intent.target, completing);
+        const qualifier =
+          /^(?<status>待办|未完成|还没完成|已完成|已经完成)的\s*(?<title>.+)$/u.exec(
+            intent.target,
+          )?.groups;
+        const allTasks = tasks.list();
+        const available = qualifier
+          ? allTasks.filter((task) => task.done === /^(?:已完成|已经完成)$/u.test(qualifier.status))
+          : allTasks;
+        const matches = findTasks(available, qualifier?.title ?? intent.target, completing);
         const [firstMatch] = matches;
         if (!firstMatch) return `没找到与「${intent.target}」匹配的任务。`;
 
         const sameTitle = matches.every((item) => item.title === firstMatch.title);
         const unfinished = completing && sameTitle ? matches.filter((item) => !item.done) : [];
         const candidates = unfinished.length ? unfinished : matches;
-        const [task] = candidates;
         if (candidates.length > 1) {
-          const titles = [...new Set(candidates.map((item) => `「${item.title}」`))].join("、");
-          return `有 ${candidates.length} 条匹配的任务（${titles}）。请用能区分任务的完整名称，并说明要${verb}哪一条。`;
+          candidates.sort((left, right) => Number(left.done) - Number(right.done));
+          return askWhich(messages, { action: intent.action, candidates });
         }
 
-        if (!completing) {
-          return tasks.remove(task.id) ? `已删除「${task.title}」。` : "这条任务已不在清单中。";
-        }
-        if (task.done) return `「${task.title}」已经是已完成状态。`;
-        const updated = tasks.update(task.id, { done: true });
-        return updated ? `已完成「${updated.title}」。` : "这条任务已不在清单中。";
+        return mutate(intent.action, candidates[0]);
       }
       case "unknown":
         return "你可以直接说接下来要做什么，比如「我晚上有个会议」。也可以问「还有哪些事没做」，或说「衣服洗好了」。";

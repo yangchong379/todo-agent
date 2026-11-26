@@ -9,7 +9,7 @@ const intentSchema = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("unknown") }),
 ]);
 
-export type Intent = z.infer<typeof intentSchema>;
+export type Intent = z.infer<typeof intentSchema> | { action: "keep"; target: string };
 
 const unknown: Intent = { action: "unknown" };
 
@@ -24,6 +24,8 @@ const pendingQuestion =
 const taskReference = "(?:这(?:个|条|项)(?:待办|任务)?|这件事)";
 const deleteVerb = "(?:删除|删掉|删了|去掉|移除)";
 const targetAtEnd = "(?:吧|谢谢)?$";
+const removalRequest =
+  /^(?:能不能|可不可以|可以|能|麻烦)?\s*(?:帮我|给我)?\s*(?<keep>别|不要|不用)?\s*(?:把|将)\s*(?<target>.+?)\s*(?:这(?:个|条|项)(?:待办|任务)?|这件事)?(?:\s*从\s*(?:我的)?(?:待办(?:清单|列表)?|任务(?:清单|列表)|清单)(?:里面|里|中)?)?\s*(?:拿掉|拿走|移出|移除|去掉|删掉|删除)(?:一下)?(?:吧|好吗|可以吗|吗)?$/u;
 const deleteFirst = new RegExp(
   "^(?:(?:帮我|给我)\\s*)?" + deleteVerb + "\\s*(.*?)" + targetAtEnd,
   "u",
@@ -107,11 +109,16 @@ function parseLocally(message: string): Intent | undefined {
     .trim();
 
   if (
-    /^(?:(?:我|你|帮我|给我|先)\s*)?(?:别|不要|不用|不必|没|尚未|还没)/u.test(text) ||
     /[，,；;。\n]\s*(?:(?:然后|再|接着|顺便)\s*)?(?:帮我\s*)?(?:记一下|记一条|提醒我|添加|新增|删掉|删除|移除|标记|把)/u.test(
       text,
     )
   ) {
+    return unknown;
+  }
+
+  const removal = removalRequest.exec(unwrap(text).replace(/[。！？!?；;]+$/u, ""))?.groups;
+  if (removal?.keep) return { action: "keep", target: unwrap(removal.target) };
+  if (/^(?:(?:我|你|帮我|给我|先)\s*)?(?:别|不要|不用|不必|没|尚未|还没)/u.test(text)) {
     return unknown;
   }
 
@@ -143,6 +150,8 @@ function parseLocally(message: string): Intent | undefined {
   ) {
     return { action: "list", status: "done" };
   }
+
+  if (removal) return { action: "delete", target: unwrap(removal.target) };
 
   const deletion = deleteLast.exec(text) ?? deleteFirst.exec(text);
   if (deletion) return { action: "delete", target: unwrap(deletion[1]) };

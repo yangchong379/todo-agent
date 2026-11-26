@@ -233,3 +233,75 @@ test("多场会议未指明目标时不替用户选择，准备会议的任务�
     [true, false, false],
   );
 });
+
+test("用口语从待办里拿掉任务时，删除目标并保留其他任务", async (t) => {
+  const { chat, request } = await startTestApp(t, { live: true });
+  await chat("帮我记一下报名讲座");
+  await chat("提醒我买牛奶");
+  assert.equal(await chat("报名讲座完成了"), "已完成「报名讲座」。");
+
+  assert.equal(await chat("能不能别把报名讲座从待办里拿掉？"), "好的，保留「报名讲座」。");
+  assert.equal(await chat("能不能把报名讲座从待办里拿掉？"), "已删除「报名讲座」。");
+  assert.match(await chat("我有哪些任务？"), /待办（1）\n• 买牛奶/u);
+  assert.equal(await chat("「帮我把买牛奶这条从我的清单里移除。」"), "已删除「买牛奶」。");
+  assert.deepEqual((await request("GET", "/api/tasks")).body, []);
+});
+
+test("同名任务可按完成状态删除，也可按上一轮候选的序号选择", async (t) => {
+  const { chat, request } = await startTestApp(t, { live: true });
+  await chat("帮我记一下报名讲座");
+  await chat("报名讲座完成了");
+  await chat("帮我记一下报名讲座");
+
+  const command = "把报名讲座拿掉";
+  const options = await chat(command);
+  assert.match(options, /1\. 待办 · 「报名讲座」\n2\. 已完成 · 「报名讲座」/u);
+  const history: ChatMessage[] = [
+    { role: "user", content: command },
+    { role: "assistant", content: options },
+  ];
+  const retry = await chat("第三条", history);
+  assert.match(retry, /请回复序号/u);
+  assert.equal(
+    await chat("第一条", [
+      ...history,
+      { role: "user", content: "第三条" },
+      { role: "assistant", content: retry },
+    ]),
+    "已删除「报名讲座」。",
+  );
+  assert.equal((await request("GET", "/api/tasks")).body.length, 1);
+  assert.equal((await request("GET", "/api/tasks")).body[0].done, true);
+
+  await chat("帮我记一下报名讲座");
+  assert.equal(await chat("把待办的报名讲座拿掉"), "已删除「报名讲座」。");
+  await chat("帮我记一下报名讲座");
+  assert.equal(await chat("把已完成的报名讲座拿掉"), "已删除「报名讲座」。");
+  assert.deepEqual(
+    (await request("GET", "/api/tasks")).body.map(({ done }: { done: boolean }) => done),
+    [false],
+  );
+});
+
+test("发生清单变动后，序号仍对应原来的任务 ID", async (t) => {
+  const { chat, request } = await startTestApp(t, { live: true });
+  await chat("帮我记一下买牛奶");
+  await chat("帮我记一下喝牛奶");
+  const before = (await request("GET", "/api/tasks")).body;
+
+  const command = "删掉牛奶";
+  const options = await chat(command);
+  await request("DELETE", "/api/tasks/" + before[0].id);
+  await chat("帮我记一下买牛奶");
+  assert.match(
+    await chat("第一条", [
+      { role: "user", content: command },
+      { role: "assistant", content: options },
+    ]),
+    /已经变化/u,
+  );
+  assert.deepEqual(
+    (await request("GET", "/api/tasks")).body.map(({ title }: { title: string }) => title),
+    ["喝牛奶", "买牛奶"],
+  );
+});
