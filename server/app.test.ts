@@ -482,3 +482,56 @@ test("随手输入的生活清单可一次记三条，确认前不会因不完�
   assert.deepEqual((await request("GET", "/api/tasks")).body, saved);
   assert.equal(resolveSchedule("明晚八点半", today())?.dueTime, "20:30");
 });
+
+test("下班的几种说法都能直接记下缴费、顺路买菜和隔天接猫", async (t) => {
+  const forms = [
+    ["下班", "下班时"],
+    ["晚上下班", "晚上下班时"],
+    ["晚上下班的时候", "晚上下班时"],
+    ["今天晚上下班的时候", "晚上下班时"],
+    ["今天下班的时候", "下班时"],
+  ] as const;
+  const day = today();
+  const nextDay = resolveDate("明天", day);
+  for (const [when, period] of forms) {
+    const { chat, request } = await startTestApp(t, { live: true });
+    const full = when + "缴停车费、顺手买菜、隔天接猫";
+    assert.match(await chat(full), /已添加 3 条待办/u);
+    const tasks = (await request("GET", "/api/tasks")).body;
+    const fields = ({
+      title,
+      dueDate,
+      duePeriod,
+      dueTime,
+    }: {
+      title: string;
+      dueDate: string;
+      duePeriod?: string;
+      dueTime?: string;
+    }) => [title, dueDate, duePeriod, dueTime];
+    assert.deepEqual(tasks.map(fields), [
+      ["缴停车费", day, period, undefined],
+      ["买菜", day, period, undefined],
+      ["接猫", nextDay, undefined, undefined],
+    ]);
+    assert.match(await chat(full), /已经在清单里/u);
+    assert.deepEqual((await request("GET", "/api/tasks")).body, tasks);
+  }
+});
+
+test("隔天以已有计划为基准，随后同一天的事不继续递增日期", async (t) => {
+  const { chat, request, filename } = await startTestApp(t, { live: true });
+  const day = today();
+  const friday = resolveDate("周五", day);
+  const saturday = resolveDate("次日", day, friday);
+  assert.match(await chat("周五下班后去取眼镜、次日拿报告和取干洗的外套"), /已添加 3 条待办/u);
+  const stored = (await request("GET", "/api/tasks")).body;
+  assert.deepEqual(
+    stored.map(({ dueDate }: { dueDate: string }) => dueDate),
+    [friday, saturday, saturday],
+  );
+  assert.equal(stored[0].duePeriod, "下班后");
+  const fresh = await startTestApp(t, { live: true, filename });
+  assert.match(await fresh.chat("去取眼镜挪到明天下班的时候"), /下班时/u);
+  assert.equal((await fresh.request("GET", "/api/tasks")).body[0].duePeriod, "下班时");
+});

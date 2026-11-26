@@ -1,4 +1,4 @@
-import { splitSchedule } from "./task-dates.ts";
+import { resolveSchedule, splitSchedule, today } from "./task-dates.ts";
 
 export interface BatchItem {
   title: string;
@@ -16,7 +16,6 @@ const standaloneActivity =
   /^(?:开会|面试|培训|体检|复诊|上课|洗澡|跑步|锻炼|游泳|购物|休息|睡觉|散步)$/u;
 const appointment =
   /^(?:还有|有)(?:一?[个场次])?(?:约|会|面试|考试|体检|复诊|\S*(?:会议|例会|周会|家长会))$/u;
-const dailyTime = /^(?:下班|放学|午饭|晚饭|回家)(?:前|后)\s*/u;
 const uncertain =
   /^(?:昨天|前天|昨晚|刚才|刚刚|已经|如果|假如|要是|万一|可能|也许|说不定|好像|大概|要不要|是不是|不(?:用|必|会|需要|打算|想|去|做|要)|没)|(?:取消了|改期了|过了吧|来不及|没法|不能|不确定|不一定|说不准|可能|也许|不过不)/u;
 const conditional = /^(?:如果|假如|要是|万一)/u;
@@ -28,7 +27,6 @@ function startsPlan(text: string) {
   const rest = (splitSchedule(phrase)?.rest ?? phrase).replace(order, "");
   return (
     modal.test(rest) ||
-    dailyTime.test(rest) ||
     record.test(rest) ||
     activity.test(rest) ||
     standaloneActivity.test(rest) ||
@@ -37,7 +35,9 @@ function startsPlan(text: string) {
 }
 
 function splitClauses(text: string) {
-  const pieces = text.split(/([，,；;。！？!?\n]|[、]|然后|顺便|接着|另外|还有|以及|并且|并|和)/u);
+  const pieces = text.split(
+    /([，,；;。！？!?\n]|[、]|然后|顺便|顺手|顺道|接着|另外|还有|以及|并且|并|和)/u,
+  );
   const clauses = [pieces[0]];
   for (let i = 1; i < pieces.length; i += 2) {
     const delimiter = pieces[i];
@@ -64,7 +64,8 @@ export function parseBatch(text: string, isQuestion: boolean): BatchItem[] | fal
   if (conditional.test(sentence.replace(subject, "")) || (isQuestion && !memo)) return false;
 
   const result: BatchItem[] = [];
-  let day: string | undefined;
+  const current = today();
+  let day = current;
   let when: string | undefined;
   let inheritsPlan = !!memo;
   let explicitPlan = !!memo;
@@ -78,8 +79,7 @@ export function parseBatch(text: string, isQuestion: boolean): BatchItem[] | fal
     const planned = leadingIntent ? statement.slice(leadingIntent[0].length) : statement;
     const schedule = splitSchedule(planned);
     const rest = (schedule?.rest ?? planned).replace(subject, "");
-    const block = dailyTime.exec(rest);
-    const action = (block ? rest.slice(block[0].length) : rest).replace(order, "");
+    const action = rest.replace(order, "");
     const intention = modal.exec(action);
     const title = (intention ? action.slice(intention[0].length) : action).trim();
     if (
@@ -88,20 +88,18 @@ export function parseBatch(text: string, isQuestion: boolean): BatchItem[] | fal
     ) {
       blockedContext = true;
       inheritsPlan = false;
-      day = undefined;
+      day = current;
       when = undefined;
       continue;
     }
 
     if (schedule) {
-      day = schedule.day ?? day ?? "今天";
-      when = day + (schedule.period ?? "") + (schedule.clock ?? "");
-    } else if (block) {
-      day ??= "今天";
-      when = day;
+      const resolved = resolveSchedule(schedule.expression, current, day);
+      day = resolved?.dueDate ?? day;
+      when = resolved ? day + (resolved.dueTime ?? resolved.period ?? "") : schedule.expression;
     }
 
-    const ownPlan = !!(memo || request || schedule || block || intention || leadingIntent);
+    const ownPlan = !!(memo || request || schedule || intention || leadingIntent);
     if (!ownPlan && (blockedContext || /(?:完了|结束了|搞定了|办妥了|好了)$/u.test(title)))
       continue;
     if (ownPlan) {
@@ -120,7 +118,10 @@ export function parseBatch(text: string, isQuestion: boolean): BatchItem[] | fal
     }
 
     result.push({
-      title: (block?.[0].trim() ?? "") + title,
+      title:
+        schedule?.routine && (schedule.relation === "前" || schedule.relation === "后")
+          ? schedule.routine + schedule.relation + title
+          : title,
       when: ownPlan || inheritsPlan ? when : undefined,
     });
     inheritsPlan ||= ownPlan;

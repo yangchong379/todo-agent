@@ -4,8 +4,14 @@ import { effortLabel, priorityLabel, sortByDueDate, taskMetadata } from "../shar
 import { interpret } from "./intent.ts";
 import { labelsToMetadata } from "./task-commands.ts";
 import type { TaskMetadata } from "./task-schema.ts";
-import { resolveSchedule, scheduleLabel, splitSchedule, today } from "./task-dates.ts";
-import { taskTitleSchema, type Task, type TaskStore } from "./task-store.ts";
+import {
+  followsPreviousDay,
+  resolveSchedule,
+  scheduleLabel,
+  splitSchedule,
+  today,
+} from "./task-dates.ts";
+import { taskTitleSchema, type NewTask, type Task, type TaskStore } from "./task-store.ts";
 
 export type { ChatMessage } from "../shared/chat.ts";
 
@@ -131,6 +137,22 @@ function renderList(tasks: Task[], status: "all" | "pending" | "done", allTasks 
 
 export function createReply(tasks: TaskStore) {
   const clarifications = new Map<string, Clarification | null>();
+  const pendingTimes = new Map<string, { task: Task; day: string } | null>();
+
+  function askTime(messages: ChatMessage[], response: string, task: Task, day: string) {
+    const content = `${response}\n「${task.title}」已记下，时间待确认。你可以直接回复「晚上」或「明早九点」补上。`;
+    const key = conversationKey([...messages, { role: "assistant", content }]);
+    if (!pendingTimes.has(key)) {
+      pendingTimes.set(key, { task, day });
+      if (pendingTimes.size > 100) {
+        const oldest = pendingTimes.keys().next();
+        if (!oldest.done) pendingTimes.delete(oldest.value);
+      }
+    } else if (pendingTimes.get(key)?.task.id !== task.id) {
+      pendingTimes.set(key, null);
+    }
+    return content;
+  }
 
   function askWhich(messages: ChatMessage[], clarification: Clarification) {
     const { verb, candidates } = clarification;
@@ -210,12 +232,13 @@ export function createReply(tasks: TaskStore) {
     title: string,
     current = today(),
     when = splitSchedule(title)?.expression,
+    precedingDay = current,
   ): TaskMetadata | undefined {
-    const schedule = when ? resolveSchedule(when, current) : undefined;
+    const schedule = when ? resolveSchedule(when, current, precedingDay) : undefined;
     if (!schedule) return undefined;
     const { dueDate, dueTime, period } = schedule;
     return {
-      dueDate: dueDate ?? current,
+      dueDate: dueDate ?? precedingDay,
       ...(dueTime ? { dueTime } : period ? { duePeriod: period } : {}),
     };
   }
@@ -296,9 +319,39 @@ export function createReply(tasks: TaskStore) {
     const message = messages.at(-1);
     if (message?.role !== "user") return "请告诉我你想管理哪条待办。";
 
+    const priorKey = conversationKey(messages.slice(0, -1));
+    const pending = pendingTimes.get(priorKey);
+    if (pending && !/[？?]/u.test(message.content)) {
+      const current = today();
+      const when = message.content
+        .replace(/^(?:那就|就)\s*/u, "")
+        .replace(/(?:吧)?[。！!]*$/u, "")
+        .trim();
+      const details = dateDetails("", current, when, pending.day);
+      if (details) {
+        const before = pending.task;
+        const task = tasks.list().find((entry) => entry.id === before.id);
+        if (
+          !task ||
+          task.title !== before.title ||
+          task.done !== before.done ||
+          task.dueDate !== before.dueDate ||
+          task.dueTime !== before.dueTime ||
+          task.duePeriod !== before.duePeriod
+        ) {
+          return "这条待办已经有变化，请带上任务名称重新设置时间。";
+        }
+        const updated = tasks.update(task.id, details);
+        if (!updated) return "这条任务已不在清单中。";
+        pendingTimes.delete(priorKey);
+        const { dueDate, dueTime, duePeriod } = taskMetadata(updated);
+        return `已把「${updated.title}」的时间补为${scheduleLabel(dueDate, dueTime, duePeriod)}。`;
+      }
+    }
+
     const number = choiceNumber(message.content);
     if (number !== undefined) {
-      const clarification = clarifications.get(conversationKey(messages.slice(0, -1)));
+      const clarification = clarifications.get(priorKey);
       if (!clarification) return "请先说要操作哪条任务，我列出候选后你就可以选序号。";
       const selected = clarification.candidates[number - 1];
       if (!selected) return askWhich(messages, clarification);
@@ -332,45 +385,73 @@ export function createReply(tasks: TaskStore) {
       }
       case "createMany": {
         const current = today();
-        const entries = [];
+        let preceding: string | undefined = current;
+        const entries = new Map<string, NewTask>();
         const skipped = [];
-        const seen = new Set(
-          tasks
-            .list()
-            .filter((task) => !task.done && typeof task.parentId !== "string")
-            .map((task) => {
-              const prefix = splitSchedule(task.title);
-              const name = (prefix?.rest || task.title).replace(/^(?:还有|有)(?:一?[个场次])/u, "");
-              const { dueDate, dueTime, duePeriod } = taskMetadata(task);
-              return JSON.stringify([normalize(name), dueDate, dueTime, duePeriod]);
-            }),
-        );
+        const unresolved = new Map<string, string>();
+        const known = new Map<string, Task[]>();
+        for (const task of tasks.list()) {
+          if (task.done || typeof task.parentId === "string") continue;
+          const { dueDate, dueTime, duePeriod } = taskMetadata(task);
+          const key = JSON.stringify([
+            normalize(withoutSchedule(task.title)),
+            dueDate,
+            dueTime,
+            duePeriod,
+          ]);
+          const matches = known.get(key) ?? [];
+          matches.push(task);
+          known.set(key, matches);
+        }
         for (const item of intent.items) {
           const title = taskTitleSchema.safeParse(item.title);
           if (!title.success) return "请让每条待办的标题保持在 1 至 200 个字符。";
-          const details = dateDetails(title.data, current, item.when);
-          if (item.when && !details)
-            return `我没认出「${title.data}」的时间「${item.when}」，请换个说法。`;
+          const sourceDay = splitSchedule(item.when ?? title.data)?.day;
+          const details: TaskMetadata | undefined =
+            preceding || (sourceDay && !followsPreviousDay.test(sourceDay))
+              ? dateDetails(title.data, current, item.when, preceding ?? current)
+              : undefined;
           const key = JSON.stringify([
             normalize(withoutSchedule(title.data)),
             details?.dueDate,
             details?.dueTime,
             details?.duePeriod,
           ]);
-          if (seen.has(key)) {
+          if (item.when && !details) {
+            unresolved.set(key, preceding ?? current);
+            preceding = undefined;
+          } else if (details?.dueDate) {
+            preceding = details.dueDate;
+          }
+          if (known.has(key) || entries.has(key)) {
             skipped.push(title.data);
           } else {
-            entries.push({ title: title.data, details });
-            seen.add(key);
+            entries.set(key, { title: title.data, details });
           }
         }
-        const added = tasks.createBatch(entries);
+        const added = tasks.createBatch([...entries.values()]);
+        [...entries.keys()].forEach((key, index) => known.set(key, [added[index]]));
         const response = added.length
           ? `已添加 ${added.length} 条待办：\n${added.map((task) => `• ${taskLine(task)}`).join("\n")}`
           : "这些待办已经在清单里。";
-        return added.length && skipped.length
-          ? `${response}\n已在清单中：${skipped.join("、")}。`
-          : response;
+        const confirmed =
+          added.length && skipped.length
+            ? `${response}\n已在清单中：${skipped.join("、")}。`
+            : response;
+        const unresolvedTasks = [...unresolved].flatMap(([key, day]) =>
+          (known.get(key) ?? []).map((task) => ({ task, day })),
+        );
+        if (unresolvedTasks.length === 1) {
+          const [{ task, day }] = unresolvedTasks;
+          return askTime(messages, confirmed, task, day);
+        }
+        if (unresolvedTasks.length) {
+          const names = [...new Set(unresolvedTasks.map(({ task }) => `「${task.title}」`))].join(
+            "、",
+          );
+          return `${confirmed}\n${names}的时间待确认。回复时请带上任务名称，比如「把${unresolvedTasks[0].task.title}改到晚上」。`;
+        }
+        return confirmed;
       }
       case "reschedule":
         return changeSchedule(messages, intent.target, intent.when, false);

@@ -12,6 +12,16 @@ export function isDayPeriod(value: unknown): value is DayPeriod {
   return dayPeriods.some((period) => value === period);
 }
 
+export const routineAnchors = ["上班", "下班", "放学", "午饭", "晚饭", "回家"] as const;
+const routinePeriod = new RegExp(
+  "^(?:" + dayPeriods.join("|") + ")?(?:" + routineAnchors.join("|") + ")(?:前|时|后)$",
+  "u",
+);
+
+export function isDuePeriod(value: unknown): value is string {
+  return typeof value === "string" && (isDayPeriod(value) || routinePeriod.test(value));
+}
+
 export const priorityLabel = { high: "高", medium: "中", low: "低" } as const;
 export const effortLabel = { small: "小", medium: "中", large: "大" } as const;
 
@@ -42,7 +52,7 @@ export function taskMetadata(task: Task) {
       typeof dueTime === "string" && /^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/u.test(dueTime)
         ? dueTime
         : undefined,
-    duePeriod: isDayPeriod(duePeriod) ? duePeriod : undefined,
+    duePeriod: isDuePeriod(duePeriod) ? duePeriod : undefined,
     priority:
       priority === "high" || priority === "medium" || priority === "low" ? priority : undefined,
     effort: effort === "small" || effort === "medium" || effort === "large" ? effort : undefined,

@@ -1,4 +1,4 @@
-import { dayPeriods, isDayPeriod, isTaskDate } from "../shared/tasks.ts";
+import { dayPeriods, isDayPeriod, isTaskDate, routineAnchors } from "../shared/tasks.ts";
 
 export function today() {
   return new Intl.DateTimeFormat("sv-SE", {
@@ -10,9 +10,16 @@ export function today() {
 }
 
 export const dateExpression =
-  /(?:\d{4}-\d{2}-\d{2}|今天|今晚|明天|明早|明晚|大后天|后天|(?:本|这|下)?(?:周|星期|礼拜)[一二三四五六日天])/u;
+  /(?:\d{4}-\d{2}-\d{2}|今天|今晚|明天|明早|明晚|大后天|后天|隔一天|隔天|次日|第二天|(?:本|这|下)?(?:周|星期|礼拜)[一二三四五六日天])/u;
 
-export function resolveDate(text: string, currentDay: string) {
+export const followsPreviousDay = /^(?:隔一天|隔天|次日|第二天)$/u;
+
+export function resolveDate(text: string, currentDay: string, precedingDay = currentDay) {
+  if (followsPreviousDay.test(text)) {
+    const date = new Date(precedingDay + "T00:00:00Z");
+    date.setUTCDate(date.getUTCDate() + 1);
+    return date.toISOString().slice(0, 10);
+  }
   if (isTaskDate(text)) return text;
   const offsets: Record<string, number> = {
     今天: 0,
@@ -47,7 +54,9 @@ const schedulePrefix = new RegExp(
     dayPeriods.join("|") +
     ")?\\s*(?<clock>" +
     clockPattern +
-    ")?",
+    ")?\\s*(?:(?<routine>" +
+    routineAnchors.join("|") +
+    ")(?<relation>之前|之后|的时候|那会儿|前|后|时)?)?",
   "u",
 );
 
@@ -100,27 +109,36 @@ function resolveClock(clock: string, period?: string) {
 
 export function splitSchedule(text: string) {
   const match = schedulePrefix.exec(text.trim());
-  const { day, period, clock } = match?.groups ?? {};
-  if (!match || (!day && !period && !clock)) return undefined;
+  const { day, period, clock, routine, relation } = match?.groups ?? {};
+  if (!match || (!day && !period && !clock && !routine)) return undefined;
   return {
     day,
     period,
     clock,
+    routine,
+    relation,
     expression: match[0].trim(),
     rest: text.trim().slice(match[0].length).trim(),
   };
 }
 
-export function resolveSchedule(when: string, current: string) {
+export function resolveSchedule(when: string, current: string, precedingDay = current) {
   const parts = splitSchedule(when);
   if (!parts || parts.rest) return undefined;
-  const { day, period, clock } = parts;
-  const dueDate = day ? resolveDate(day, current) : undefined;
+  const { day, period, clock, routine, relation } = parts;
+  const dueDate = day ? resolveDate(day, current, precedingDay) : undefined;
   const clockPeriod =
     period ?? (day === "今晚" || day === "明晚" ? "晚上" : day === "明早" ? "早上" : undefined);
   const dueTime = clock ? resolveClock(clock, clockPeriod) : undefined;
   if ((day && !dueDate) || (clock && !dueTime)) return undefined;
-  return { dueDate, dueTime, period: isDayPeriod(clockPeriod) ? clockPeriod : undefined };
+  const window = routine
+    ? (period ?? "") +
+      routine +
+      (relation?.endsWith("前") ? "前" : relation?.endsWith("后") ? "后" : "时")
+    : isDayPeriod(clockPeriod)
+      ? clockPeriod
+      : undefined;
+  return { dueDate, dueTime, period: window };
 }
 
 export function scheduleLabel(date?: string, time?: string, period?: string) {

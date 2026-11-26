@@ -116,7 +116,8 @@ components:
       description: 应用时区的 24 小时时刻，null 表示清除
     DuePeriod:
       type: [string, "null"]
-      enum: [凌晨, 早上, 上午, 中午, 下午, 傍晚, 晚上, 夜里, null]
+      pattern: "^(凌晨|早上|上午|中午|下午|傍晚|晚上|夜里|(?:凌晨|早上|上午|中午|下午|傍晚|晚上|夜里)?(?:上班|下班|放学|午饭|晚饭|回家)(?:前|时|后))$"
+      description: 时段或生活事件前、时、后，null 表示清除
     Priority:
       type: [string, "null"]
       enum: [high, medium, low, null]
