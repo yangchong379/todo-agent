@@ -19,17 +19,19 @@ npm run dev
 
 ## 代码入口
 
-| 文件                                         | 用途                                       |
-| -------------------------------------------- | ------------------------------------------ |
-| [src/App.tsx](src/App.tsx)                   | 聊天界面，发送当前页面的对话历史并显示回复 |
-| [server/index.ts](server/index.ts)           | 接入智能体与任务存储，启动服务             |
-| [server/agent.ts](server/agent.ts)           | 匹配任务，执行操作并返回回复文本           |
-| [server/intent.ts](server/intent.ts)         | 本地规则和可选的 DeepSeek 意图解析         |
-| [server/model.ts](server/model.ts)           | 服务端 DeepSeek 客户端与模型配置           |
-| [server/tasks.ts](server/tasks.ts)           | 任务 API 的输入校验和 HTTP 响应            |
-| [server/app.ts](server/app.ts)               | 接收对话历史，调用智能体并挂载任务 API     |
-| [server/task-store.ts](server/task-store.ts) | 读写本地 JSON 任务清单                     |
-| [server/openapi.yaml](server/openapi.yaml)   | 任务请求和响应的完整定义                   |
+| 文件                                               | 用途                                       |
+| -------------------------------------------------- | ------------------------------------------ |
+| [src/App.tsx](src/App.tsx)                         | 聊天界面，发送当前页面的对话历史并显示回复 |
+| [server/index.ts](server/index.ts)                 | 接入智能体与任务存储，启动服务             |
+| [server/agent.ts](server/agent.ts)                 | 匹配任务，执行操作并返回回复文本           |
+| [server/intent.ts](server/intent.ts)               | 本地规则和可选的 DeepSeek 意图解析         |
+| [server/model.ts](server/model.ts)                 | 服务端 DeepSeek 客户端与模型配置           |
+| [src/TaskList.tsx](src/TaskList.tsx)               | 可折叠的任务清单、标签与子任务进度         |
+| [server/task-commands.ts](server/task-commands.ts) | 截止日期、子任务和标签的中文指令解析       |
+| [server/tasks.ts](server/tasks.ts)                 | 任务 API 的输入校验和 HTTP 响应            |
+| [server/app.ts](server/app.ts)                     | 接收对话历史，调用智能体并挂载任务 API     |
+| [server/task-store.ts](server/task-store.ts)       | 读写本地 JSON 任务清单                     |
+| [server/openapi.yaml](server/openapi.yaml)         | 任务请求和响应的完整定义                   |
 
 ## 手动验证接口
 

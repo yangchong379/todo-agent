@@ -1,16 +1,22 @@
 import { createHash } from "node:crypto";
 import type { ChatMessage } from "../shared/chat.ts";
+import { effortLabel, priorityLabel, sortByDueDate, taskMetadata } from "../shared/tasks.ts";
 import { interpret } from "./intent.ts";
+import { labelsToMetadata } from "./task-commands.ts";
+import { dateExpression, resolveDate, today } from "./task-dates.ts";
 import { taskTitleSchema, type Task, type TaskStore } from "./task-store.ts";
 
 export type { ChatMessage } from "../shared/chat.ts";
 
-type Mutation = "complete" | "delete";
+type Mutation = "complete" | "delete" | "reopen";
 
 interface Clarification {
-  action: Mutation;
+  verb: string;
   candidates: Task[];
+  execute(task: Task): string;
 }
+
+const datePrefix = new RegExp("^" + dateExpression.source, "u");
 
 function conversationKey(messages: ChatMessage[]) {
   const turns = messages.map(({ role, content }) => [role, content]);
@@ -67,15 +73,45 @@ function findTasks(tasks: Task[], target: string, complete: boolean) {
   return titles.filter((item) => item.name.includes(name)).map(({ task }) => task);
 }
 
-function renderList(tasks: Task[], status: "all" | "pending" | "done") {
+function taskLine(task: Task) {
+  const { dueDate, priority, effort } = taskMetadata(task);
+  const details = [
+    dueDate && `截止 ${dueDate}`,
+    priority && `优先级${priorityLabel[priority]}`,
+    effort && `工作量${effortLabel[effort]}`,
+  ].filter(Boolean);
+  return task.title + (details.length ? `（${details.join(" · ")}）` : "");
+}
+
+function renderList(tasks: Task[], status: "all" | "pending" | "done", allTasks = tasks) {
   const pending = tasks.filter((task) => !task.done);
   const done = tasks.filter((task) => task.done);
   if (status === "all" && tasks.length === 0) return "清单还是空的。";
 
-  const section = (label: string, items: Task[]) =>
-    items.length
-      ? [`${label}（${items.length}）`, ...items.map((task) => `• ${task.title}`)].join("\n")
-      : `暂无${label}任务。`;
+  function section(label: string, items: Task[]) {
+    if (!items.length) return `暂无${label}任务。`;
+    const ordered = sortByDueDate(items);
+    const parents = new Map(allTasks.map((task) => [task.id, task]));
+    const itemIds = new Set(items.map((task) => task.id));
+    const children = new Map<string, Task[]>();
+    const rows = [];
+    for (const task of ordered) {
+      const parentId = typeof task.parentId === "string" ? task.parentId : undefined;
+      if (parentId && itemIds.has(parentId)) {
+        const siblings = children.get(parentId) ?? [];
+        siblings.push(task);
+        children.set(parentId, siblings);
+      } else {
+        const parent = parentId ? parents.get(parentId) : undefined;
+        rows.push({ task, prefix: parent ? `${parent.title} / ` : "" });
+      }
+    }
+    const lines = rows.flatMap(({ task, prefix }) => [
+      `• ${prefix}${taskLine(task)}`,
+      ...(children.get(task.id) ?? []).map((child) => `  ↳ ${taskLine(child)}`),
+    ]);
+    return [`${label}（${items.length}）`, ...lines].join("\n");
+  }
   const sections = [];
   if (status !== "done") sections.push(section("待办", pending));
   if (status !== "pending") sections.push(section("已完成", done));
@@ -86,11 +122,13 @@ export function createReply(tasks: TaskStore) {
   const clarifications = new Map<string, Clarification | null>();
 
   function askWhich(messages: ChatMessage[], clarification: Clarification) {
-    const { action, candidates } = clarification;
-    const verb = action === "delete" ? "删除" : "完成";
-    const options = candidates.map(
-      (task, index) => `${index + 1}. ${task.done ? "已完成" : "待办"} · 「${task.title}」`,
-    );
+    const { verb, candidates } = clarification;
+    const parents = new Map(tasks.list().map((task) => [task.id, task.title]));
+    const options = candidates.map((task, index) => {
+      const parent = typeof task.parentId === "string" ? parents.get(task.parentId) : undefined;
+      const title = parent ? `${parent} / ${task.title}` : task.title;
+      return `${index + 1}. ${task.done ? "已完成" : "待办"} · 「${title}」`;
+    });
     const content = `有 ${candidates.length} 条匹配的任务。请回复序号，选择要${verb}哪一条。\n${options.join("\n")}`;
     const key = conversationKey([...messages, { role: "assistant", content }]);
     const existing = clarifications.get(key);
@@ -109,11 +147,52 @@ export function createReply(tasks: TaskStore) {
 
   function mutate(action: Mutation, task: Task) {
     if (action === "delete") {
-      return tasks.remove(task.id) ? `已删除「${task.title}」。` : "这条任务已不在清单中。";
+      const children = tasks.list().filter((item) => item.parentId === task.id).length;
+      if (!tasks.remove(task.id)) return "这条任务已不在清单中。";
+      return `已删除「${task.title}」${children ? `及其 ${children} 条子任务` : ""}。`;
+    }
+    if (action === "reopen") {
+      const updated = tasks.update(task.id, { done: false });
+      return updated ? `「${task.title}」已恢复为待办。` : "这条任务已不在清单中。";
     }
     if (task.done) return `「${task.title}」已经是已完成状态。`;
     const updated = tasks.update(task.id, { done: true });
     return updated ? `已完成「${updated.title}」。` : "这条任务已不在清单中。";
+  }
+
+  function chooseTask(
+    messages: ChatMessage[],
+    target: string,
+    available: Task[],
+    verb: string,
+    execute: (task: Task) => string,
+    completing = false,
+  ) {
+    const scope = /^(?<status>待办|未完成|还没完成|已完成|已经完成)的\s*(?<title>.+)$/u.exec(
+      target,
+    )?.groups;
+    const done = scope?.status.startsWith("已");
+    const matches = findTasks(
+      scope ? available.filter((task) => task.done === done) : available,
+      scope?.title ?? target,
+      completing,
+    );
+    const [first] = matches;
+    if (!first) return `没找到与「${target}」匹配的任务。`;
+    const unfinished =
+      completing && matches.every((task) => task.title === first.title)
+        ? matches.filter((task) => !task.done)
+        : [];
+    const candidates = unfinished.length ? unfinished : matches;
+    if (candidates.length === 1) return execute(candidates[0]);
+    candidates.sort((left, right) => Number(left.done) - Number(right.done));
+    return askWhich(messages, { verb, candidates, execute });
+  }
+
+  function dateDetails(title: string) {
+    const prefix = datePrefix.exec(title)?.[0];
+    const dueDate = prefix ? resolveDate(prefix, today()) : undefined;
+    return dueDate ? { dueDate } : undefined;
   }
 
   return async function reply(messages: ChatMessage[]): Promise<string> {
@@ -130,7 +209,7 @@ export function createReply(tasks: TaskStore) {
       if (!task || task.title !== selected.title || task.done !== selected.done) {
         return "刚才选中的任务已经变化，请重新说要操作哪条任务。";
       }
-      return mutate(clarification.action, task);
+      return clarification.execute(task);
     }
 
     const intent = await interpret(message.content);
@@ -138,13 +217,99 @@ export function createReply(tasks: TaskStore) {
       case "create": {
         const title = taskTitleSchema.safeParse(intent.title);
         if (!title.success) return "请提供 1 至 200 个字符的任务标题。";
-        const existing = tasks.list().find((task) => !task.done && task.title === title.data);
+        const existing = tasks
+          .list()
+          .find(
+            (task) => !task.done && typeof task.parentId !== "string" && task.title === title.data,
+          );
         if (existing) return `「${existing.title}」已经在待办清单里了。`;
-        const created = tasks.create(title.data);
+        const created = tasks.create(title.data, dateDetails(title.data));
         return `已添加待办「${created.title}」。`;
       }
       case "list":
         return renderList(tasks.list(), intent.status);
+      case "due": {
+        const current = today();
+        const allTasks = tasks.list();
+        const due = allTasks.filter((task) => {
+          const date = taskMetadata(task).dueDate;
+          return (
+            date && (intent.period === "today" ? date === current : date < current && !task.done)
+          );
+        });
+        const label = intent.period === "today" ? `今天到期（${current}）` : "逾期未完成";
+        if (!due.length)
+          return intent.period === "today" ? "今天没有到期的任务。" : "没有逾期未完成的任务。";
+        return `${label}\n${renderList(due, intent.period === "today" ? "all" : "pending", allTasks)}`;
+      }
+      case "createSubtask":
+      case "listSubtasks":
+      case "renameSubtask":
+      case "changeSubtask": {
+        const parents = tasks.list().filter((task) => typeof task.parentId !== "string");
+        return chooseTask(messages, intent.parent, parents, "操作", (parent) => {
+          const children = tasks.list().filter((task) => task.parentId === parent.id);
+          if (intent.action === "listSubtasks") {
+            return children.length
+              ? `「${parent.title}」的子任务\n${renderList(children, "all")}`
+              : `「${parent.title}」还没有子任务。`;
+          }
+          if (intent.action === "changeSubtask") {
+            const label = { complete: "完成", delete: "删除", reopen: "恢复" }[intent.operation];
+            return chooseTask(
+              messages,
+              intent.title,
+              children,
+              label,
+              (child) => mutate(intent.operation, child),
+              intent.operation === "complete",
+            );
+          }
+          if (intent.action === "renameSubtask") {
+            const title = taskTitleSchema.safeParse(intent.newTitle);
+            if (!title.success) return "请提供 1 至 200 个字符的新标题。";
+            return chooseTask(messages, intent.title, children, "重命名", (child) => {
+              const updated = tasks.update(child.id, { title: title.data });
+              return updated
+                ? `已将子任务「${child.title}」改名为「${updated.title}」。`
+                : "这条子任务已不在清单中。";
+            });
+          }
+          const title = taskTitleSchema.safeParse(intent.title);
+          if (!title.success) return "请提供 1 至 200 个字符的子任务标题。";
+          const duplicate = children.some((task) => !task.done && task.title === title.data);
+          if (duplicate) return `「${parent.title}」已有待办子任务「${title.data}」。`;
+          const child = tasks.createSubtask(parent.id, title.data, dateDetails(title.data));
+          return child
+            ? `已为「${parent.title}」添加子任务「${child.title}」。`
+            : "找不到可添加子任务的主任务。";
+        });
+      }
+      case "editTask": {
+        const value = intent.value.trim();
+        const cleared = /^(?:无|清除|未设置)$/u.test(value);
+        const date = intent.field === "截止日期" ? resolveDate(value, today()) : undefined;
+        const details =
+          intent.field === "截止日期"
+            ? cleared || date
+              ? { dueDate: date ?? null }
+              : undefined
+            : labelsToMetadata(intent.field, value);
+        if (!details) {
+          return {
+            截止日期: "请使用今天、明天或 YYYY-MM-DD 格式的日期。",
+            优先级: "请使用高、中、低。",
+            工作量: "请使用小、中、大。",
+          }[intent.field];
+        }
+        return chooseTask(messages, intent.target, tasks.list(), `更新${intent.field}`, (task) => {
+          const updated = tasks.update(task.id, details);
+          if (!updated) return "这条任务已不在清单中。";
+          return cleared
+            ? `已清除「${task.title}」的${intent.field}。`
+            : `已将「${task.title}」的${intent.field}设为${date ?? value}。`;
+        });
+      }
       case "keep":
         return `好的，保留「${intent.target}」。`;
       case "complete":
@@ -158,27 +323,14 @@ export function createReply(tasks: TaskStore) {
           return `你想${verb}哪条任务？请带上任务名称。`;
         }
 
-        const qualifier =
-          /^(?<status>待办|未完成|还没完成|已完成|已经完成)的\s*(?<title>.+)$/u.exec(
-            intent.target,
-          )?.groups;
-        const allTasks = tasks.list();
-        const available = qualifier
-          ? allTasks.filter((task) => task.done === /^(?:已完成|已经完成)$/u.test(qualifier.status))
-          : allTasks;
-        const matches = findTasks(available, qualifier?.title ?? intent.target, completing);
-        const [firstMatch] = matches;
-        if (!firstMatch) return `没找到与「${intent.target}」匹配的任务。`;
-
-        const sameTitle = matches.every((item) => item.title === firstMatch.title);
-        const unfinished = completing && sameTitle ? matches.filter((item) => !item.done) : [];
-        const candidates = unfinished.length ? unfinished : matches;
-        if (candidates.length > 1) {
-          candidates.sort((left, right) => Number(left.done) - Number(right.done));
-          return askWhich(messages, { action: intent.action, candidates });
-        }
-
-        return mutate(intent.action, candidates[0]);
+        return chooseTask(
+          messages,
+          intent.target,
+          tasks.list(),
+          verb,
+          (task) => mutate(intent.action, task),
+          completing,
+        );
       }
       case "unknown":
         return "你可以直接说接下来要做什么，比如「我晚上有个会议」。也可以问「还有哪些事没做」，或说「衣服洗好了」。";

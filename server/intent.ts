@@ -1,6 +1,7 @@
 import type { ChatCompletionCreateParamsNonStreaming } from "openai/resources/chat/completions";
 import { z } from "zod";
 import { getModelClient, model } from "./model.ts";
+import { parseTaskCommand, type TaskCommand } from "./task-commands.ts";
 
 const intentSchema = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("create"), title: z.string().trim().min(1) }),
@@ -9,7 +10,10 @@ const intentSchema = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("unknown") }),
 ]);
 
-export type Intent = z.infer<typeof intentSchema> | { action: "keep"; target: string };
+export type Intent =
+  | z.infer<typeof intentSchema>
+  | { action: "keep"; target: string }
+  | TaskCommand;
 
 const unknown: Intent = { action: "unknown" };
 
@@ -121,6 +125,9 @@ function parseLocally(message: string): Intent | undefined {
   if (/^(?:(?:我|你|帮我|给我|先)\s*)?(?:别|不要|不用|不必|没|尚未|还没)/u.test(text)) {
     return unknown;
   }
+
+  const taskCommand = parseTaskCommand(text);
+  if (taskCommand) return taskCommand;
 
   const creation = createPattern.exec(text) ?? addToList.exec(text);
   if (creation) return { action: "create", title: unwrap(creation[1]) };

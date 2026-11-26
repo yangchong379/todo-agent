@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: 小明智能体任务 API
-  version: 1.0.0
+  version: 1.1.0
 servers:
   - url: http://127.0.0.1:3000
 paths:
@@ -12,6 +12,10 @@ paths:
       responses:
         "200":
           description: 任务列表；空列表为 []
+          headers:
+            X-Todo-Today:
+              description: 应用时区的当前日期
+              schema: { type: string, format: date }
           content:
             application/json:
               schema:
@@ -25,11 +29,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              additionalProperties: false
-              required: [title]
-              properties:
-                title: { $ref: "#/components/schemas/Title" }
+              $ref: "#/components/schemas/CreateTask"
       responses:
         "201":
           description: 新建的任务
@@ -45,7 +45,7 @@ paths:
         schema: { type: string }
     patch:
       operationId: updateTask
-      summary: 修改标题或完成状态
+      summary: 修改任务标题、完成状态或标签
       requestBody:
         required: true
         content:
@@ -57,6 +57,9 @@ paths:
               properties:
                 title: { $ref: "#/components/schemas/Title" }
                 done: { type: boolean }
+                dueDate: { $ref: "#/components/schemas/DueDate" }
+                priority: { $ref: "#/components/schemas/Priority" }
+                effort: { $ref: "#/components/schemas/Effort" }
       responses:
         "200":
           description: 更新后的任务
@@ -67,10 +70,32 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
     delete:
       operationId: deleteTask
-      summary: 删除一条任务
+      summary: 删除任务及其子任务
       responses:
         "204":
           description: 删除成功，响应体为空
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/tasks/{id}/subtasks:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      operationId: createSubtask
+      summary: 在主任务下创建子任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTask" }
+      responses:
+        "201":
+          description: 新建的子任务
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 components:
   schemas:
@@ -79,6 +104,25 @@ components:
       description: 首尾空白会自动去除，去除后长度应为 1 至 200
       minLength: 1
       maxLength: 200
+    DueDate:
+      type: [string, "null"]
+      format: date
+      description: YYYY-MM-DD 格式的截止日期，null 表示清除
+    Priority:
+      type: [string, "null"]
+      enum: [high, medium, low, null]
+    Effort:
+      type: [string, "null"]
+      enum: [small, medium, large, null]
+    CreateTask:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title: { $ref: "#/components/schemas/Title" }
+        dueDate: { $ref: "#/components/schemas/DueDate" }
+        priority: { $ref: "#/components/schemas/Priority" }
+        effort: { $ref: "#/components/schemas/Effort" }
     Task:
       type: object
       required: [id, title, done]
@@ -86,6 +130,10 @@ components:
         id: { type: string, format: uuid }
         title: { $ref: "#/components/schemas/Title" }
         done: { type: boolean }
+        parentId: { type: string, description: 仅子任务有主任务 ID }
+        dueDate: { $ref: "#/components/schemas/DueDate" }
+        priority: { $ref: "#/components/schemas/Priority" }
+        effort: { $ref: "#/components/schemas/Effort" }
     Error:
       type: object
       required: [error]

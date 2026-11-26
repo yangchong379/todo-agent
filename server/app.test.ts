@@ -8,6 +8,7 @@ import { test, type TestContext } from "node:test";
 import type { ChatMessage } from "../shared/chat.ts";
 import { createReply } from "./agent.ts";
 import { createApp } from "./app.ts";
+import { resolveDate, today } from "./task-dates.ts";
 import { createJsonTaskStore } from "./task-store.ts";
 
 async function startTestApp(t: TestContext, options: { live?: boolean; filename?: string } = {}) {
@@ -304,4 +305,88 @@ test("发生清单变动后，序号仍对应原来的任务 ID", async (t) => {
     (await request("GET", "/api/tasks")).body.map(({ title }: { title: string }) => title),
     ["喝牛奶", "买牛奶"],
   );
+});
+
+test("按日期查询今天到期和逾期，任务日期及标签在重启后保留", async (t) => {
+  const { chat, request, filename } = await startTestApp(t, { live: true });
+  assert.equal(await chat("今天有哪些任务到期？"), "今天没有到期的任务。");
+  await chat("帮我记一下今天交报告");
+  await chat("明天得去取快递");
+  await chat("帮我记一下准备汇报");
+  assert.match(await chat("把准备汇报的截止日期设为2020-01-01"), /2020-01-01/u);
+  assert.match(await chat("把交报告的优先级设为高"), /优先级设为高/u);
+  assert.match(await chat("把交报告的工作量设为中"), /工作量设为中/u);
+  assert.match(await chat("把交报告的截止日期设为2026-02-30"), /YYYY-MM-DD/u);
+  const fresh = await startTestApp(t, { live: true, filename });
+  const due = await fresh.chat("今天有哪些任务到期？");
+  assert.match(due, /今天交报告（截止 \d{4}-\d{2}-\d{2} · 优先级高 · 工作量中）/u);
+  assert.doesNotMatch(due, /取快递|准备汇报/u);
+  assert.match(await fresh.chat("有哪些逾期任务？"), /准备汇报/u);
+  const items = (await request("GET", "/api/tasks")).body;
+  assert.equal(items[0].dueDate, today());
+  assert.equal(items[0].priority, "high");
+  assert.equal(items[0].effort, "medium");
+  assert.equal(items[1].dueDate, resolveDate("明天", today()));
+  await fresh.chat("把交报告的优先级设为无");
+  assert.equal((await request("GET", "/api/tasks")).body[0].priority, null);
+});
+
+test("子任务可分组查看、改名、完成、恢复和删除", async (t) => {
+  const { chat, request } = await startTestApp(t, { live: true });
+  await chat("帮我记一下准备汇报");
+  await chat("帮我记一下准备面试");
+  assert.match(await chat("给准备汇报加个子任务：整理数据"), /添加子任务/u);
+  assert.match(await chat("为准备面试添加子任务：整理数据"), /添加子任务/u);
+  assert.match(await chat("看看准备汇报的子任务"), /准备汇报」的子任务\n待办（1）\n• 整理数据/u);
+  assert.match(await chat("我的待办"), /• 准备汇报\n  ↳ 整理数据/u);
+  assert.equal(await chat("完成准备汇报的子任务整理数据"), "已完成「整理数据」。");
+  assert.match(await chat("把准备汇报的子任务整理数据标为未完成"), /恢复为待办/u);
+  assert.match(await chat("把准备汇报的子任务整理数据改名为整理成本"), /改名为「整理成本」/u);
+  assert.equal(await chat("把准备汇报的子任务整理成本删掉"), "已删除「整理成本」。");
+  assert.match(await chat("看看准备汇报的子任务"), /还没有子任务/u);
+  assert.equal(await chat("删掉准备面试"), "已删除「准备面试」及其 1 条子任务。");
+  const stored = (await request("GET", "/api/tasks")).body;
+  assert.deepEqual(
+    stored.map(({ title }: { title: string }) => title),
+    ["准备汇报"],
+  );
+});
+
+test("任务 API 校验元数据、创建关联子任务并保持原有响应格式", async (t) => {
+  const { request } = await startTestApp(t);
+  const path = "/api/tasks";
+  const invalid = await request("POST", path, { title: "测试", priority: "urgent" });
+  assert.equal(invalid.status, 400);
+  const parent = await request("POST", path, { title: "主任务", dueDate: "2028-02-29" });
+  assert.equal(parent.status, 201);
+  const child = await request("POST", path + "/" + parent.body.id + "/subtasks", {
+    title: "子任务",
+    priority: "medium",
+    effort: "small",
+  });
+  assert.equal(child.status, 201);
+  assert.equal(child.body.parentId, parent.body.id);
+  assert.equal(
+    (await request("POST", path + "/" + child.body.id + "/subtasks", { title: "测试" })).status,
+    404,
+  );
+  assert.equal(
+    (await request("PATCH", path + "/" + child.body.id, { parentId: null })).status,
+    400,
+  );
+  assert.equal(
+    (await request("PATCH", path + "/" + child.body.id, { done: true, effort: "large" })).body
+      .effort,
+    "large",
+  );
+  assert.equal((await request("DELETE", path + "/" + parent.body.id)).status, 204);
+  assert.deepEqual((await request("GET", path)).body, []);
+});
+
+test("相对日期跨月跨年，并校验日期有效性", () => {
+  assert.equal(resolveDate("明天", "2025-12-31"), "2026-01-01");
+  assert.equal(resolveDate("下周一", "2025-12-31"), "2026-01-05");
+  assert.equal(resolveDate("本周日", "2025-12-31"), "2026-01-04");
+  assert.equal(resolveDate("2025-02-29", "2025-12-31"), undefined);
+  assert.equal(resolveDate("toString", "2025-12-31"), undefined);
 });

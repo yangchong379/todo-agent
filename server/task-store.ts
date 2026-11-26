@@ -1,18 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { z } from "zod";
+import type { Task } from "../shared/tasks.ts";
+import { taskSchema, type TaskMetadata } from "./task-schema.ts";
 
-export const taskTitleSchema = z.string().trim().min(1).max(200);
+export type { Task } from "../shared/tasks.ts";
+export { taskTitleSchema } from "./task-schema.ts";
 
-const storedTask = z.looseObject({ id: z.string(), title: z.string(), done: z.boolean() });
-const taskList = z.array(storedTask);
-export type Task = z.infer<typeof storedTask>;
-type TaskChanges = Partial<Pick<Task, "title" | "done">>;
+export type TaskChanges = Partial<Pick<Task, "title" | "done">> & TaskMetadata;
 
 export interface TaskStore {
   list(): Task[];
-  create(title: string): Task;
+  create(title: string, details?: TaskMetadata): Task;
+  createSubtask(parentId: string, title: string, details?: TaskMetadata): Task | undefined;
   update(id: string, changes: TaskChanges): Task | undefined;
   remove(id: string): boolean;
 }
@@ -20,7 +20,7 @@ export interface TaskStore {
 export function createJsonTaskStore(filename: string): TaskStore {
   function list(): Task[] {
     if (!existsSync(filename)) return [];
-    return taskList.parse(JSON.parse(readFileSync(filename, "utf8")));
+    return taskSchema.array().parse(JSON.parse(readFileSync(filename, "utf8")));
   }
 
   // 同一服务进程内同步完成读写；替换文件前，原清单始终完整可读。
@@ -34,9 +34,19 @@ export function createJsonTaskStore(filename: string): TaskStore {
   return {
     list,
 
-    create(title) {
-      const task = { id: randomUUID(), title, done: false };
+    create(title, details) {
+      const task = { ...details, id: randomUUID(), title, done: false };
       save([...list(), task]);
+      return task;
+    },
+
+    createSubtask(parentId, title, details) {
+      const tasks = list();
+      if (!tasks.some((task) => task.id === parentId && typeof task.parentId !== "string")) {
+        return undefined;
+      }
+      const task = { ...details, id: randomUUID(), title, done: false, parentId };
+      save([...tasks, task]);
       return task;
     },
 
@@ -52,8 +62,8 @@ export function createJsonTaskStore(filename: string): TaskStore {
 
     remove(id) {
       const tasks = list();
-      const remaining = tasks.filter((task) => task.id !== id);
-      if (remaining.length === tasks.length) return false;
+      const remaining = tasks.filter((task) => task.id !== id && task.parentId !== id);
+      if (!tasks.some((task) => task.id === id)) return false;
 
       save(remaining);
       return true;
