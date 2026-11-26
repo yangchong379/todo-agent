@@ -17,7 +17,7 @@ function TaskEntry({
   today: string;
   children?: Task[];
 }) {
-  const { dueDate, priority, effort } = taskMetadata(task);
+  const { dueDate, dueTime, duePeriod, priority, effort } = taskMetadata(task);
   const overdue = dueDate && dueDate < today && !task.done;
   const dueToday = dueDate === today && !task.done;
   return (
@@ -33,7 +33,10 @@ function TaskEntry({
           {dueDate && (
             <span className={overdue ? "overdue" : dueToday ? "due-today" : ""}>
               {overdue ? "逾期" : dueToday ? "今天到期" : "截止"}{" "}
-              <time dateTime={dueDate}>{dueDate}</time>
+              <time dateTime={dueTime ? dueDate + "T" + dueTime : dueDate}>
+                {dueDate}
+                {dueTime || duePeriod ? " " + (dueTime ?? duePeriod) : ""}
+              </time>
             </span>
           )}
           {priority && (

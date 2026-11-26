@@ -9,9 +9,15 @@ export { taskTitleSchema } from "./task-schema.ts";
 
 export type TaskChanges = Partial<Pick<Task, "title" | "done">> & TaskMetadata;
 
+export interface NewTask {
+  title: string;
+  details?: TaskMetadata;
+}
+
 export interface TaskStore {
   list(): Task[];
   create(title: string, details?: TaskMetadata): Task;
+  createBatch(entries: NewTask[]): Task[];
   createSubtask(parentId: string, title: string, details?: TaskMetadata): Task | undefined;
   update(id: string, changes: TaskChanges): Task | undefined;
   remove(id: string): boolean;
@@ -38,6 +44,18 @@ export function createJsonTaskStore(filename: string): TaskStore {
       const task = { ...details, id: randomUUID(), title, done: false };
       save([...list(), task]);
       return task;
+    },
+
+    createBatch(entries) {
+      if (!entries.length) return [];
+      const added = entries.map(({ title, details }) => ({
+        ...details,
+        id: randomUUID(),
+        title,
+        done: false,
+      }));
+      save([...list(), ...added]);
+      return added;
     },
 
     createSubtask(parentId, title, details) {

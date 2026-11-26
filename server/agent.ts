@@ -3,7 +3,8 @@ import type { ChatMessage } from "../shared/chat.ts";
 import { effortLabel, priorityLabel, sortByDueDate, taskMetadata } from "../shared/tasks.ts";
 import { interpret } from "./intent.ts";
 import { labelsToMetadata } from "./task-commands.ts";
-import { dateExpression, resolveDate, today } from "./task-dates.ts";
+import type { TaskMetadata } from "./task-schema.ts";
+import { resolveSchedule, scheduleLabel, splitSchedule, today } from "./task-dates.ts";
 import { taskTitleSchema, type Task, type TaskStore } from "./task-store.ts";
 
 export type { ChatMessage } from "../shared/chat.ts";
@@ -15,8 +16,6 @@ interface Clarification {
   candidates: Task[];
   execute(task: Task): string;
 }
-
-const datePrefix = new RegExp("^" + dateExpression.source, "u");
 
 function conversationKey(messages: ChatMessage[]) {
   const turns = messages.map(({ role, content }) => [role, content]);
@@ -40,14 +39,19 @@ function normalize(title: string) {
     .replace(/[\p{P}\s]/gu, "");
 }
 
-function findTasks(tasks: Task[], target: string, complete: boolean) {
-  const savedTitle = tasks.filter((task) => task.title === target);
+function findTasks(
+  tasks: Task[],
+  target: string,
+  complete: boolean,
+  titleOf: (task: Task) => string = (task) => task.title,
+) {
+  const savedTitle = tasks.filter((task) => titleOf(task) === target);
   if (savedTitle.length) return savedTitle;
 
   const name = normalize(target);
   if (!name) return [];
 
-  const titles = tasks.map((task) => ({ task, name: normalize(task.title) }));
+  const titles = tasks.map((task) => ({ task, name: normalize(titleOf(task)) }));
   const exact = titles.filter((item) => item.name === name);
   if (exact.length) return exact.map(({ task }) => task);
 
@@ -73,10 +77,17 @@ function findTasks(tasks: Task[], target: string, complete: boolean) {
   return titles.filter((item) => item.name.includes(name)).map(({ task }) => task);
 }
 
+function withoutSchedule(title: string) {
+  const prefix = splitSchedule(title);
+  const name = prefix?.rest || title;
+  return name.replace(/^(?:的\s*|(?:还有|有)(?:一?[个场次]))/u, "").trim() || title;
+}
+
 function taskLine(task: Task) {
-  const { dueDate, priority, effort } = taskMetadata(task);
+  const { dueDate, dueTime, duePeriod, priority, effort } = taskMetadata(task);
+  const deadline = scheduleLabel(dueDate, dueTime, duePeriod);
   const details = [
-    dueDate && `截止 ${dueDate}`,
+    deadline && `截止 ${deadline}`,
     priority && `优先级${priorityLabel[priority]}`,
     effort && `工作量${effortLabel[effort]}`,
   ].filter(Boolean);
@@ -127,7 +138,9 @@ export function createReply(tasks: TaskStore) {
     const options = candidates.map((task, index) => {
       const parent = typeof task.parentId === "string" ? parents.get(task.parentId) : undefined;
       const title = parent ? `${parent} / ${task.title}` : task.title;
-      return `${index + 1}. ${task.done ? "已完成" : "待办"} · 「${title}」`;
+      const { dueDate, dueTime, duePeriod } = taskMetadata(task);
+      const deadline = scheduleLabel(dueDate, dueTime, duePeriod);
+      return `${index + 1}. ${task.done ? "已完成" : "待办"} · 「${title}」${deadline ? ` · ${deadline}` : ""}`;
     });
     const content = `有 ${candidates.length} 条匹配的任务。请回复序号，选择要${verb}哪一条。\n${options.join("\n")}`;
     const key = conversationKey([...messages, { role: "assistant", content }]);
@@ -166,7 +179,10 @@ export function createReply(tasks: TaskStore) {
     available: Task[],
     verb: string,
     execute: (task: Task) => string,
-    completing = false,
+    {
+      completing = false,
+      titleOf,
+    }: { completing?: boolean; titleOf?: (task: Task) => string } = {},
   ) {
     const scope = /^(?<status>待办|未完成|还没完成|已完成|已经完成)的\s*(?<title>.+)$/u.exec(
       target,
@@ -176,6 +192,7 @@ export function createReply(tasks: TaskStore) {
       scope ? available.filter((task) => task.done === done) : available,
       scope?.title ?? target,
       completing,
+      titleOf,
     );
     const [first] = matches;
     if (!first) return `没找到与「${target}」匹配的任务。`;
@@ -189,10 +206,90 @@ export function createReply(tasks: TaskStore) {
     return askWhich(messages, { verb, candidates, execute });
   }
 
-  function dateDetails(title: string) {
-    const prefix = datePrefix.exec(title)?.[0];
-    const dueDate = prefix ? resolveDate(prefix, today()) : undefined;
-    return dueDate ? { dueDate } : undefined;
+  function dateDetails(
+    title: string,
+    current = today(),
+    when = splitSchedule(title)?.expression,
+  ): TaskMetadata | undefined {
+    const schedule = when ? resolveSchedule(when, current) : undefined;
+    if (!schedule) return undefined;
+    const { dueDate, dueTime, period } = schedule;
+    return {
+      dueDate: dueDate ?? current,
+      ...(dueTime ? { dueTime } : period ? { duePeriod: period } : {}),
+    };
+  }
+
+  function changeSchedule(
+    messages: ChatMessage[],
+    target: string,
+    when: string,
+    explicit: boolean,
+  ) {
+    const current = today();
+    const clearing = explicit && /^(?:无|清除|未设置)$/u.test(when);
+    const schedule = resolveSchedule(when, current);
+    if (!clearing && !schedule) {
+      return "请告诉我改到哪天或几点，比如后天下午三点，也可以用 YYYY-MM-DD。";
+    }
+
+    const query = target.replace(/^(?:刚才的|刚才那个|那个|那场|这场)\s*/u, "");
+    const prefix = splitSchedule(query);
+    const remainder = prefix?.rest.replace(/^(?:的|那场|这场)\s*/u, "");
+    const previous =
+      prefix?.day && remainder ? resolveSchedule(prefix.expression, current) : undefined;
+    const available = tasks.list().filter((task) => {
+      if (!previous?.dueDate) return true;
+      const saved = taskMetadata(task);
+      const titleSchedule = splitSchedule(task.title);
+      const titleFallback = titleSchedule
+        ? resolveSchedule(titleSchedule.expression, current)
+        : undefined;
+      return (
+        (saved.dueDate ?? titleFallback?.dueDate) === previous.dueDate &&
+        (!previous.dueTime || (saved.dueTime ?? titleFallback?.dueTime) === previous.dueTime) &&
+        (!previous.period ||
+          previous.dueTime ||
+          (saved.duePeriod ?? titleFallback?.period) === previous.period)
+      );
+    });
+    return chooseTask(
+      messages,
+      withoutSchedule(previous && remainder ? remainder : query),
+      available,
+      "改期",
+      (task) => {
+        const old = taskMetadata(task);
+        const inTitle = splitSchedule(task.title);
+        const oldTitleTime = inTitle ? resolveSchedule(inTitle.expression, current) : undefined;
+        const oldDate = old.dueDate ?? oldTitleTime?.dueDate;
+        const oldTime = old.dueTime ?? oldTitleTime?.dueTime;
+        const oldPeriod = old.duePeriod ?? oldTitleTime?.period;
+        const dueDate = clearing ? null : (schedule?.dueDate ?? oldDate ?? current);
+        const dueTime = clearing
+          ? null
+          : (schedule?.dueTime ?? (schedule?.period ? null : oldTime));
+        const duePeriod = clearing || dueTime ? null : (schedule?.period ?? oldPeriod);
+        const changed =
+          dueDate !== oldDate ||
+          (dueTime ?? undefined) !== oldTime ||
+          (duePeriod ?? undefined) !== oldPeriod;
+        // 旧版会在标题里保存相对时间。改期后去掉旧前缀，日期和时刻由独立字段显示。
+        const title = changed && inTitle ? withoutSchedule(task.title) : task.title;
+        const updated = tasks.update(task.id, { title, dueDate, dueTime, duePeriod });
+        if (!updated) return "这条任务已不在清单中。";
+        if (clearing) return `已清除「${updated.title}」的截止日期。`;
+        const label = scheduleLabel(
+          dueDate ?? undefined,
+          dueTime ?? undefined,
+          duePeriod ?? undefined,
+        );
+        return explicit
+          ? `已将「${updated.title}」的截止日期设为${label}。`
+          : `已把「${updated.title}」改到${label}。`;
+      },
+      { titleOf: (task) => withoutSchedule(task.title) },
+    );
   }
 
   return async function reply(messages: ChatMessage[]): Promise<string> {
@@ -206,7 +303,14 @@ export function createReply(tasks: TaskStore) {
       const selected = clarification.candidates[number - 1];
       if (!selected) return askWhich(messages, clarification);
       const task = tasks.list().find((item) => item.id === selected.id);
-      if (!task || task.title !== selected.title || task.done !== selected.done) {
+      if (
+        !task ||
+        task.title !== selected.title ||
+        task.done !== selected.done ||
+        task.dueDate !== selected.dueDate ||
+        task.dueTime !== selected.dueTime ||
+        task.duePeriod !== selected.duePeriod
+      ) {
         return "刚才选中的任务已经变化，请重新说要操作哪条任务。";
       }
       return clarification.execute(task);
@@ -226,6 +330,50 @@ export function createReply(tasks: TaskStore) {
         const created = tasks.create(title.data, dateDetails(title.data));
         return `已添加待办「${created.title}」。`;
       }
+      case "createMany": {
+        const current = today();
+        const entries = [];
+        const skipped = [];
+        const seen = new Set(
+          tasks
+            .list()
+            .filter((task) => !task.done && typeof task.parentId !== "string")
+            .map((task) => {
+              const prefix = splitSchedule(task.title);
+              const name = (prefix?.rest || task.title).replace(/^(?:还有|有)(?:一?[个场次])/u, "");
+              const { dueDate, dueTime, duePeriod } = taskMetadata(task);
+              return JSON.stringify([normalize(name), dueDate, dueTime, duePeriod]);
+            }),
+        );
+        for (const item of intent.items) {
+          const title = taskTitleSchema.safeParse(item.title);
+          if (!title.success) return "请让每条待办的标题保持在 1 至 200 个字符。";
+          const details = dateDetails(title.data, current, item.when);
+          if (item.when && !details)
+            return `我没认出「${title.data}」的时间「${item.when}」，请换个说法。`;
+          const key = JSON.stringify([
+            normalize(withoutSchedule(title.data)),
+            details?.dueDate,
+            details?.dueTime,
+            details?.duePeriod,
+          ]);
+          if (seen.has(key)) {
+            skipped.push(title.data);
+          } else {
+            entries.push({ title: title.data, details });
+            seen.add(key);
+          }
+        }
+        const added = tasks.createBatch(entries);
+        const response = added.length
+          ? `已添加 ${added.length} 条待办：\n${added.map((task) => `• ${taskLine(task)}`).join("\n")}`
+          : "这些待办已经在清单里。";
+        return added.length && skipped.length
+          ? `${response}\n已在清单中：${skipped.join("、")}。`
+          : response;
+      }
+      case "reschedule":
+        return changeSchedule(messages, intent.target, intent.when, false);
       case "list":
         return renderList(tasks.list(), intent.status);
       case "due": {
@@ -262,7 +410,7 @@ export function createReply(tasks: TaskStore) {
               children,
               label,
               (child) => mutate(intent.operation, child),
-              intent.operation === "complete",
+              { completing: intent.operation === "complete" },
             );
           }
           if (intent.action === "renameSubtask") {
@@ -287,17 +435,12 @@ export function createReply(tasks: TaskStore) {
       }
       case "editTask": {
         const value = intent.value.trim();
+        if (intent.field === "截止日期")
+          return changeSchedule(messages, intent.target, value, true);
         const cleared = /^(?:无|清除|未设置)$/u.test(value);
-        const date = intent.field === "截止日期" ? resolveDate(value, today()) : undefined;
-        const details =
-          intent.field === "截止日期"
-            ? cleared || date
-              ? { dueDate: date ?? null }
-              : undefined
-            : labelsToMetadata(intent.field, value);
+        const details = labelsToMetadata(intent.field, value);
         if (!details) {
           return {
-            截止日期: "请使用今天、明天或 YYYY-MM-DD 格式的日期。",
             优先级: "请使用高、中、低。",
             工作量: "请使用小、中、大。",
           }[intent.field];
@@ -307,7 +450,7 @@ export function createReply(tasks: TaskStore) {
           if (!updated) return "这条任务已不在清单中。";
           return cleared
             ? `已清除「${task.title}」的${intent.field}。`
-            : `已将「${task.title}」的${intent.field}设为${date ?? value}。`;
+            : `已将「${task.title}」的${intent.field}设为${value}。`;
         });
       }
       case "keep":
@@ -329,11 +472,11 @@ export function createReply(tasks: TaskStore) {
           tasks.list(),
           verb,
           (task) => mutate(intent.action, task),
-          completing,
+          { completing },
         );
       }
       case "unknown":
-        return "你可以直接说接下来要做什么，比如「我晚上有个会议」。也可以问「还有哪些事没做」，或说「衣服洗好了」。";
+        return "你可以直接说接下来要做什么，比如「明早去拿药，下午得洗衣服」。也可以说「面试改到后天」或问「还有哪些事没做」。";
     }
   };
 }

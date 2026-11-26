@@ -1,6 +1,7 @@
 import type { TaskMetadata } from "./task-schema.ts";
 
 export type TaskCommand =
+  | { action: "reschedule"; target: string; when: string }
   | { action: "due"; period: "today" | "overdue" }
   | { action: "createSubtask"; parent: string; title: string }
   | { action: "listSubtasks"; parent: string }
@@ -26,6 +27,9 @@ const editTask =
   /^(?:帮我|给我)?(?:把|将)?\s*(?<target>.+?)\s*(?:的)?(?<field>截止日期|截止日|截止时间|优先级|工作量)\s*(?:设为|改为|设置为|调整为|标为|是|[:：])\s*(?<value>.+)$/u;
 const editDeadline =
   /^(?:帮我)?(?:把|将)\s*(?<target>.+?)\s*(?:设为|改为|设置为)\s*(?<value>.+?)(?:到期|截止)$/u;
+
+const reschedule =
+  /^(?:(?:能不能|可不可以|可以|能|麻烦)\s*)?(?:帮我|给我)?\s*(?:把|将)?\s*(?<target>[^，,。；;！？!?\n]+?)\s*(?:的?(?:日期|时间))?\s*(?:改到|挪到|移到|移至|调到|换到|推到|推迟到|延到|延至|延后到|提前到|改期到|改成|改在|改为)\s*(?<when>[^，,。；;！？!?\n]+?)(?:了|吧|就行|可以吗|行吗|好吗|吗)?$/u;
 
 function name(text: string) {
   return text.trim().replace(/^(?:「(.+)」|“(.+)”|"(.+)")$/u, (_match, a, b, c) => a ?? b ?? c);
@@ -89,6 +93,22 @@ export function parseTaskCommand(text: string): TaskCommand | undefined {
       target: name(date.target),
       field: "截止日期",
       value: name(date.value),
+    };
+  const clauses = text
+    .split(/[，,。；;\n]/u)
+    .map((clause) => clause.trim())
+    .filter(Boolean);
+  const background = clauses.slice(0, -1);
+  const move = !background.some((clause) =>
+    /(?:记一下|记下|添加|新增|删掉|删除|标为|(?:还)?(?:要|得)去|改(?:到|期到))/u.test(clause),
+  )
+    ? reschedule.exec(clauses.at(-1) ?? "")?.groups
+    : undefined;
+  if (move)
+    return {
+      action: "reschedule",
+      target: name(move.target.replace(/(?:又|临时|现在)$/u, "")),
+      when: name(move.when),
     };
 }
 

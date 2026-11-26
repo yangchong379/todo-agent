@@ -8,7 +8,7 @@ import { test, type TestContext } from "node:test";
 import type { ChatMessage } from "../shared/chat.ts";
 import { createReply } from "./agent.ts";
 import { createApp } from "./app.ts";
-import { resolveDate, today } from "./task-dates.ts";
+import { resolveDate, resolveSchedule, today } from "./task-dates.ts";
 import { createJsonTaskStore } from "./task-store.ts";
 
 async function startTestApp(t: TestContext, options: { live?: boolean; filename?: string } = {}) {
@@ -389,4 +389,96 @@ test("相对日期跨月跨年，并校验日期有效性", () => {
   assert.equal(resolveDate("本周日", "2025-12-31"), "2026-01-04");
   assert.equal(resolveDate("2025-02-29", "2025-12-31"), undefined);
   assert.equal(resolveDate("toString", "2025-12-31"), undefined);
+});
+
+test("招聘方临时改档时，按原日期定位同名面试，原时刻和状态保留", async (t) => {
+  const { chat, request, filename } = await startTestApp(t, { live: true });
+  const day = today();
+  const tomorrow = resolveDate("明天", day);
+  const later = resolveDate("后天", day);
+  await chat("我明天上午九点有一个面试");
+  await chat("下周二下午两点有一个面试");
+  const initial = (await request("GET", "/api/tasks")).body;
+  assert.equal(initial.length, 2);
+  assert.equal(initial[0].dueDate, tomorrow);
+  assert.equal(initial[0].dueTime, "09:00");
+
+  const several = await chat("面试挪到后天了");
+  assert.match(several, /有 2 条匹配/u);
+  const moved = await chat("招聘方刚联系我，明天的面试改到后天了");
+  assert.match(moved, /已把「面试」改到.*09:00/u);
+  const fresh = await startTestApp(t, { live: true, filename });
+  const after = (await fresh.request("GET", "/api/tasks")).body;
+  assert.deepEqual(after[0], { ...initial[0], title: "面试", dueDate: later, duePeriod: null });
+  assert.deepEqual(after[1], initial[1]);
+
+  const vague = "那场面试挪到下午三点半吧";
+  const options = await fresh.chat(vague);
+  assert.match(options, /有 2 条匹配/u);
+  assert.deepEqual((await fresh.request("GET", "/api/tasks")).body, after);
+  assert.match(
+    await fresh.chat("第一条", [
+      { role: "user", content: vague },
+      { role: "assistant", content: options },
+    ]),
+    /15:30/u,
+  );
+  const exact = (await fresh.request("GET", "/api/tasks")).body;
+  assert.equal(exact[0].dueDate, later);
+  assert.equal(exact[0].dueTime, "15:30");
+  assert.deepEqual(exact[1], initial[1]);
+  assert.match(await fresh.chat("把后天的面试改到25:30"), /哪天或几点/u);
+  assert.deepEqual((await fresh.request("GET", "/api/tasks")).body, exact);
+});
+
+test("接送、取药和家务可以一起记下，下午和晚上沿用当天日期", async (t) => {
+  const { chat, request, filename } = await startTestApp(t, { live: true });
+  const user = "明早先送孩子去学校，下午三点去药房拿药，晚上还得洗衣服和给邻居回个电话。";
+  const tomorrow = resolveDate("明天", today());
+  assert.match(await chat(user), /已添加 4 条待办/u);
+  const stored = (await request("GET", "/api/tasks")).body;
+  assert.deepEqual(
+    stored.map((item: { title: string }) => item.title),
+    ["送孩子去学校", "去药房拿药", "洗衣服", "给邻居回个电话"],
+  );
+  assert.ok(stored.every((item: { dueDate: string }) => item.dueDate === tomorrow));
+  assert.equal(stored[1].dueTime, "15:00");
+  assert.equal(stored[2].duePeriod, "晚上");
+  const fresh = await startTestApp(t, { live: true, filename });
+  assert.deepEqual((await fresh.request("GET", "/api/tasks")).body, stored);
+  assert.match(await fresh.chat(user), /已经在清单里/u);
+  assert.deepEqual((await fresh.request("GET", "/api/tasks")).body, stored);
+});
+
+test("一天跑两趟时，购物品项合在一条，已经做过的事和假设不会入清单", async (t) => {
+  const { chat, request } = await startTestApp(t, { live: true });
+  await chat("昨晚跟物业谈过了，今天下班后得去缴停车费，顺便买西红柿和鸡蛋。");
+  await chat("如果能提前下班，晚上去游泳和找朋友吃宵夜。");
+  await chat("昨天买菜、洗衣服和打游戏。");
+  await chat("今天要去找物业和洗车吗？");
+  await chat("周五下班前得把报销单交了，然后去菜站买西红柿和鸡蛋。");
+  const saved = (await request("GET", "/api/tasks")).body;
+  assert.deepEqual(
+    saved.map((item: { title: string }) => item.title),
+    ["下班后去缴停车费", "买西红柿和鸡蛋", "下班前把报销单交了", "去菜站买西红柿和鸡蛋"],
+  );
+  assert.equal(saved[0].dueDate, today());
+  assert.equal(saved[1].dueDate, today());
+  assert.equal(saved[2].dueDate, resolveDate("周五", today()));
+  assert.equal(saved[3].dueDate, saved[2].dueDate);
+  assert.match(await chat("今天有哪些任务到期？"), /买西红柿和鸡蛋/u);
+});
+
+test("随手输入的生活清单可一次记三条，确认前不会因不完整或混合指令部分写入", async (t) => {
+  const { chat, request } = await startTestApp(t, { live: true });
+  assert.match(await chat("我见天要吃饭、洗衣服和打游戏"), /已添加 3 条待办/u);
+  const saved = (await request("GET", "/api/tasks")).body;
+  assert.deepEqual(
+    saved.map((item: { title: string }) => item.title),
+    ["吃饭", "洗衣服", "打游戏"],
+  );
+  assert.ok(saved.every((item: { dueDate: string }) => item.dueDate === today()));
+  await chat("帮我记一下明天去银行，然后删掉洗衣服");
+  assert.deepEqual((await request("GET", "/api/tasks")).body, saved);
+  assert.equal(resolveSchedule("明晚八点半", today())?.dueTime, "20:30");
 });

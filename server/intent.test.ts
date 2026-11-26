@@ -38,3 +38,31 @@ test("DeepSeek 只解释本轮消息，拒绝无效参数或用户未提到的�
   modelContent = " ";
   assert.deepEqual(await interpret(message), { action: "unknown" });
 });
+
+test("复杂的口语可以让模型拆出多个待办，逐项检查标题和时间是否来自原消息", async (t) => {
+  const previousKey = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = "test-key";
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = previousKey;
+  });
+
+  const message = "周五的安排之一是报名讲座，另一个是替小杨校对展位图";
+  let result = {
+    action: "createMany",
+    items: [
+      { title: "报名讲座", when: "周五" },
+      { title: "替小杨校对展位图", when: "周五" },
+    ],
+  };
+  const mock = t.mock.method(globalThis, "fetch", async () =>
+    Response.json({ choices: [{ message: { content: JSON.stringify(result) } }] }),
+  );
+
+  assert.deepEqual(await interpret(message), result);
+  result = { ...result, items: [result.items[0], { title: "缴纳停车费", when: "周五" }] };
+  assert.deepEqual(await interpret(message), { action: "unknown" });
+  result = { ...result, items: [{ title: "报名讲座", when: "明天" }] };
+  assert.deepEqual(await interpret(message), { action: "unknown" });
+  assert.equal(mock.mock.callCount(), 3);
+});
